@@ -4,3 +4,5 @@ main.js.map
 .obsidian/
 versions.json
 data.json
+esbuild.config.mjs
+package-lock.json

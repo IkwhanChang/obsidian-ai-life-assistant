@@ -1,0 +1,10 @@
+{
+	"id": "obsidian-ai-life-assistant",
+	"name": "AI Life Assistant",
+	"version": "0.1.0",
+	"minAppVersion": "1.0.0",
+	"description": "Assists with document processing using ChatGPT.",
+	"author": "Your Name",
+	"authorUrl": "",
+	"isDesktopOnly": false
+}

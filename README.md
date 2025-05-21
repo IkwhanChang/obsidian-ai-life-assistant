@@ -7,7 +7,6 @@
 *   **AI-Powered Content Generation:** Generate text, summarize notes, or brainstorm ideas with AI assistance.
 *   **Smart Suggestions:** Get relevant suggestions and completions as you type.
 *   **Customizable Prompts:** Tailor AI interactions to your specific needs with custom prompts.
-*   *(여기에 실제 구현된 다른 기능들을 추가해주세요. 예: "AI Chat Interface", "Image Generation via AI")*
 
 ## 📖 User Manual
 

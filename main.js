@@ -31,7 +31,13 @@ var import_obsidian = require("obsidian");
 var AI_ASSISTANT_VIEW_TYPE = "ai-life-assistant-view";
 var DEFAULT_SETTINGS = {
   openAiApiKey: "",
-  defaultModel: "gpt-4o-mini"
+  defaultModel: "gpt-4o-mini",
+  promptFilePath: "",
+  // Default to no prompt file selected
+  promptFilesFolderPath: "",
+  // Default to no specific prompt folder (list all MD files)
+  chatHistory: []
+  // Initialize with an empty history
 };
 var CHARS_PER_TOKEN = 3.5;
 var MAX_CONTEXT_TOKENS = 15e3;
@@ -77,7 +83,9 @@ ${userPrompt}` : userPrompt;
 var AiAssistantView = class extends import_obsidian.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
-    // For displaying concatenated file names
+    // To manage button state
+    this.thinkingPEl = null;
+    // To keep track of the "Thinking..." p element
     this.currentContextContent = "";
     this.plugin = plugin;
   }
@@ -96,29 +104,67 @@ var AiAssistantView = class extends import_obsidian.ItemView {
   async onOpen() {
     const container = this.contentEl;
     container.empty();
-    container.createEl("h4", { text: "AI Life Assistant" });
-    const inputRow = container.createDiv({ cls: "ai-input-row" });
-    const folderSelectContainer = inputRow.createDiv({
+    container.style.display = "flex";
+    container.style.flexDirection = "column";
+    container.style.height = "100%";
+    const responseSectionDiv = container.createDiv({ cls: "ai-response-section" });
+    responseSectionDiv.style.flex = "6";
+    responseSectionDiv.style.overflowY = "auto";
+    responseSectionDiv.style.display = "flex";
+    responseSectionDiv.style.flexDirection = "column";
+    this.responseDivEl = responseSectionDiv.createDiv({ cls: "ai-response-area" });
+    this.responseDivEl.style.flexGrow = "1";
+    this.responseDivEl.style.padding = "8px";
+    this.responseDivEl.style.overflowY = "auto";
+    const inputSectionDiv = container.createDiv({ cls: "ai-input-section" });
+    inputSectionDiv.style.flex = "4";
+    inputSectionDiv.style.overflowY = "auto";
+    inputSectionDiv.style.padding = "10px";
+    inputSectionDiv.style.borderTop = "1px solid var(--background-modifier-border)";
+    inputSectionDiv.createEl("h5", { text: "AI Life Assistant" });
+    const folderSelectContainer = inputSectionDiv.createDiv({
       cls: "ai-folder-select-container"
     });
+    folderSelectContainer.style.display = "flex";
+    folderSelectContainer.style.alignItems = "center";
     folderSelectContainer.style.marginBottom = "10px";
-    folderSelectContainer.createEl("label", {
+    this.folderLabelEl = folderSelectContainer.createEl("label", {
+      // Now child of inputSectionDiv
       text: "Context Folder:",
       cls: "ai-folder-label"
-    }).style.marginRight = "5px";
+    });
+    this.folderLabelEl.style.marginRight = "5px";
     this.folderSelectEl = folderSelectContainer.createEl("select");
-    this.folderSelectEl.style.marginRight = "10px";
     this.populateFolderDropdown();
     this.folderSelectEl.addEventListener(
       "change",
       () => this.handleFolderSelectionChange()
     );
-    const promptArea = container.createDiv({ cls: "ai-prompt-area" });
+    const promptFileSelectContainer = inputSectionDiv.createDiv({
+      cls: "ai-prompt-file-select-container"
+    });
+    promptFileSelectContainer.style.display = "flex";
+    promptFileSelectContainer.style.alignItems = "center";
+    promptFileSelectContainer.style.marginBottom = "10px";
+    this.promptFileLabelEl = promptFileSelectContainer.createEl("label", {
+      // Now child of inputSectionDiv
+      text: "Select Prompt File:",
+      cls: "ai-prompt-file-label"
+    });
+    this.promptFileLabelEl.style.marginRight = "5px";
+    this.promptFileSelectEl = promptFileSelectContainer.createEl("select");
+    this.populatePromptFileDropdown();
+    this.promptFileSelectEl.addEventListener(
+      "change",
+      () => this.handlePromptFileSelectionChange()
+    );
+    const promptArea = inputSectionDiv.createDiv({ cls: "ai-prompt-area" });
     promptArea.style.display = "flex";
     promptArea.style.alignItems = "flex-end";
     promptArea.style.gap = "8px";
     promptArea.style.marginBottom = "5px";
     this.promptInputEl = promptArea.createEl("textarea", {
+      // Now child of inputSectionDiv
       attr: { placeholder: "Enter your prompt for the AI..." }
     });
     this.promptInputEl.style.flexGrow = "1";
@@ -131,14 +177,21 @@ var AiAssistantView = class extends import_obsidian.ItemView {
       this.promptInputEl.style.height = `${this.promptInputEl.scrollHeight}px`;
       this.updateTokenWarning();
     });
-    const submitButton = promptArea.createEl("button", { text: "Ask AI" });
-    submitButton.style.height = "min-content";
-    this.tokenWarningEl = container.createEl("p", { cls: "ai-token-warning" });
+    this.submitButtonEl = promptArea.createEl("button", { text: "Ask AI" });
+    this.submitButtonEl.style.height = "min-content";
+    this.tokenWarningEl = inputSectionDiv.createEl("p", { cls: "ai-token-warning" });
     this.tokenWarningEl.style.color = "var(--text-error)";
     this.tokenWarningEl.style.fontSize = "0.9em";
     this.tokenWarningEl.style.display = "none";
     this.tokenWarningEl.style.marginBottom = "10px";
-    this.concatenatedFilesListEl = container.createDiv({
+    const concatenatedFilesDisplayRow = inputSectionDiv.createDiv({
+      cls: "ai-input-row concatenated-files-display-row"
+    });
+    concatenatedFilesDisplayRow.style.display = "flex";
+    concatenatedFilesDisplayRow.style.alignItems = "flex-start";
+    concatenatedFilesDisplayRow.style.marginBottom = "10px";
+    this.concatenatedFilesListEl = concatenatedFilesDisplayRow.createDiv({
+      // Now child of inputSectionDiv
       cls: "ai-concatenated-files-list"
     });
     this.concatenatedFilesListEl.style.fontSize = "0.85em";
@@ -147,22 +200,35 @@ var AiAssistantView = class extends import_obsidian.ItemView {
     this.concatenatedFilesListEl.style.overflowY = "auto";
     this.concatenatedFilesListEl.style.border = "1px dashed var(--background-modifier-border)";
     this.concatenatedFilesListEl.style.padding = "5px";
-    this.concatenatedFilesListEl.style.marginBottom = "10px";
     this.concatenatedFilesListEl.setText("No context files loaded yet.");
-    this.responseDivEl = container.createDiv({ cls: "ai-response-area" });
-    this.responseDivEl.style.marginTop = "8px";
-    this.responseDivEl.style.borderTop = "1px solid var(--background-modifier-border)";
-    this.responseDivEl.style.paddingTop = "8px";
-    this.responseDivEl.style.maxHeight = "calc(100vh - 300px)";
-    this.responseDivEl.style.overflowY = "auto";
-    inputRow.style.display = "flex";
-    inputRow.style.alignItems = "flex-end";
-    inputRow.style.gap = "8px";
-    inputRow.style.marginBottom = "10px";
     const handleSubmit = async () => {
+      const originalButtonText = this.submitButtonEl.textContent;
+      this.submitButtonEl.textContent = "Thinking...";
+      this.setUIEnabled(false);
+      const isFirstUserInteractionInSession = this.plugin.settings.chatHistory.length === 0 && !this.responseDivEl.querySelector(".conversation-entry");
+      if (isFirstUserInteractionInSession) {
+        this.responseDivEl.empty();
+      }
+      if (this.thinkingPEl && this.thinkingPEl.parentElement === this.responseDivEl) {
+        this.thinkingPEl.remove();
+        this.thinkingPEl = null;
+      }
+      this.thinkingPEl = this.responseDivEl.createEl("p", {
+        text: "Thinking..."
+      });
+      this.thinkingPEl.addClass("ai-thinking-message");
+      this.thinkingPEl.style.fontStyle = "italic";
+      this.thinkingPEl.style.textAlign = "center";
+      this.thinkingPEl.style.padding = "10px";
       const userPromptText = this.promptInputEl.value;
       if (!userPromptText.trim()) {
         new import_obsidian.Notice("Please enter a prompt.");
+        if (this.thinkingPEl && this.thinkingPEl.parentElement) {
+          this.thinkingPEl.remove();
+          this.thinkingPEl = null;
+        }
+        this.submitButtonEl.textContent = originalButtonText;
+        this.setUIEnabled(true);
         return;
       }
       const totalTokens = this.estimateTokens(
@@ -176,32 +242,42 @@ var AiAssistantView = class extends import_obsidian.ItemView {
           `Token limit exceeded! Current: ~${totalTokens} (Max: ${MAX_CONTEXT_TOKENS}). Shorten prompt or context.`
         );
         this.tokenWarningEl.style.display = "block";
+        if (this.thinkingPEl && this.thinkingPEl.parentElement) {
+          this.thinkingPEl.remove();
+          this.thinkingPEl = null;
+        }
+        this.submitButtonEl.textContent = originalButtonText;
+        this.setUIEnabled(true);
         return;
       }
       try {
-        new import_obsidian.Notice("AI\uC5D0\uAC8C \uBB3C\uC5B4\uBCF4\uB294 \uC911...");
-        this.responseDivEl.empty();
         const systemPrompt = "You are a helpful AI assistant. Please format your response in Markdown.";
-        const response = await this.plugin.callOpenAI(
+        const rawMarkdownResponse = await this.plugin.callOpenAI(
           systemPrompt,
           userPromptText,
           this.currentContextContent
         );
-        await import_obsidian.MarkdownRenderer.renderMarkdown(
-          response,
-          this.responseDivEl,
-          this.app.vault.getRoot().path,
-          // Base path for relative links
-          this
-          // Cast to Component
-        );
+        if (this.thinkingPEl && this.thinkingPEl.parentElement) {
+          this.thinkingPEl.remove();
+          this.thinkingPEl = null;
+        }
+        const newEntry = {
+          timestamp: Date.now(),
+          userPrompt: userPromptText,
+          aiResponse: rawMarkdownResponse
+        };
+        this.plugin.settings.chatHistory.push(newEntry);
+        await this.plugin.saveSettings();
+        this.renderConversationEntry(newEntry, true);
         this.promptInputEl.value = "";
         this.promptInputEl.style.height = "auto";
         this.promptInputEl.rows = 1;
-        this.promptInputEl.focus();
         this.updateTokenWarning();
       } catch (error) {
-        this.responseDivEl.empty();
+        if (this.thinkingPEl && this.thinkingPEl.parentElement) {
+          this.thinkingPEl.remove();
+          this.thinkingPEl = null;
+        }
         if (error.message !== "OpenAI API Key not set.") {
           console.error("Error interacting with AI from panel:", error);
           new import_obsidian.Notice(`Error: ${error.message}. Check console for details.`);
@@ -210,10 +286,19 @@ var AiAssistantView = class extends import_obsidian.ItemView {
           text: `Error: ${error.message}`,
           cls: "ai-error-message"
         });
+        errorP.style.padding = "10px";
         errorP.style.color = "var(--text-error)";
+      } finally {
+        if (this.thinkingPEl && this.thinkingPEl.parentNode === this.responseDivEl) {
+          this.thinkingPEl.remove();
+          this.thinkingPEl = null;
+        }
+        this.submitButtonEl.textContent = originalButtonText;
+        this.setUIEnabled(true);
+        this.promptInputEl.focus();
       }
     };
-    submitButton.addEventListener("click", handleSubmit);
+    this.submitButtonEl.addEventListener("click", handleSubmit);
     this.promptInputEl.addEventListener(
       "keydown",
       async (event) => {
@@ -223,13 +308,176 @@ var AiAssistantView = class extends import_obsidian.ItemView {
         }
       }
     );
+    if (this.plugin.settings.promptFilePath) {
+      const defaultPromptFile = this.app.vault.getAbstractFileByPath(
+        this.plugin.settings.promptFilePath
+      );
+      if (defaultPromptFile instanceof import_obsidian.TFile && defaultPromptFile.extension === "md") {
+        const optionExists = Array.from(this.promptFileSelectEl.options).some(
+          (opt) => opt.value === defaultPromptFile.path
+        );
+        if (optionExists) {
+          this.promptFileSelectEl.value = defaultPromptFile.path;
+          await this.handlePromptFileSelectionChange();
+        }
+      }
+    }
+    const currentActiveFile = this.app.workspace.getActiveFile();
+    await this.syncWithActiveFile(
+      currentActiveFile instanceof import_obsidian.TFile ? currentActiveFile : null
+    );
+    this.loadAndDisplayHistory();
+    this.updateLabelForFolderSelect();
+    this.updateLabelForPromptFileSelect();
     this.updateTokenWarning();
+    this.registerEvent(
+      this.app.workspace.on(
+        "active-leaf-change",
+        this.handleActiveLeafChange.bind(this)
+      )
+    );
     setTimeout(() => this.promptInputEl.focus(), 50);
+  }
+  setUIEnabled(enabled) {
+    this.promptInputEl.disabled = !enabled;
+    this.submitButtonEl.disabled = !enabled;
+    this.folderSelectEl.disabled = !enabled;
+    this.promptFileSelectEl.disabled = !enabled;
+  }
+  async renderConversationEntry(entry, isNewest = false) {
+    const entryContainer = this.responseDivEl.createDiv({ cls: "conversation-entry" });
+    entryContainer.style.marginBottom = "20px";
+    entryContainer.style.padding = "10px";
+    entryContainer.style.border = "1px solid var(--background-modifier-border-hover)";
+    entryContainer.style.borderRadius = "5px";
+    const userPromptDiv = entryContainer.createDiv({ cls: "user-prompt-entry" });
+    userPromptDiv.createEl("strong", { text: "You:" });
+    const userP = userPromptDiv.createEl("p", { text: entry.userPrompt });
+    userP.style.whiteSpace = "pre-wrap";
+    userP.style.marginTop = "5px";
+    const aiResponseDiv = entryContainer.createDiv({ cls: "ai-response-entry" });
+    aiResponseDiv.style.marginTop = "10px";
+    aiResponseDiv.createEl("strong", { text: "AI:" });
+    const aiResponseContentDiv = aiResponseDiv.createDiv();
+    aiResponseContentDiv.style.marginTop = "5px";
+    await import_obsidian.MarkdownRenderer.renderMarkdown(
+      entry.aiResponse,
+      aiResponseContentDiv,
+      this.app.vault.getRoot().path,
+      this
+    );
+    const copyButtonContainer = aiResponseDiv.createDiv({ cls: "ai-response-copy-button-container" });
+    copyButtonContainer.style.textAlign = "right";
+    copyButtonContainer.style.marginTop = "10px";
+    const copyButton = copyButtonContainer.createEl("button", { text: "Copy" });
+    copyButton.addClass("mod-cta");
+    copyButton.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(entry.aiResponse);
+        new import_obsidian.Notice("Response copied to clipboard!");
+      } catch (err) {
+        console.error("Failed to copy response: ", err);
+        new import_obsidian.Notice("Failed to copy response.");
+      }
+    });
+    if (isNewest) {
+      const responseSection = this.responseDivEl.parentElement;
+      if (responseSection) {
+        responseSection.scrollTop = responseSection.scrollHeight;
+      }
+    }
+  }
+  displayInitialMessage() {
+    if (!this.responseDivEl)
+      return;
+    this.responseDivEl.empty();
+    this.responseDivEl.createEl("h4", { text: "Welcome to AI Life Assistant!" });
+    const p1 = this.responseDivEl.createEl("p");
+    p1.innerHTML = `\uBA70Select a <strong>Context Folder</strong> from the options below. The content of the files within this folder (up to the token limit of ~${MAX_CONTEXT_TOKENS}) will be combined with your prompt to provide context to the AI.`;
+    p1.style.marginBottom = "10px";
+    const p2 = this.responseDivEl.createEl("p");
+    p2.innerHTML = `You can set a <strong>Default Prompt File</strong> and a specific <strong>Prompt Files Folder</strong> in the plugin settings (click the gear icon in Obsidian's sidebar) for quicker access to your favorite prompts.`;
+    p2.style.marginBottom = "10px";
+    const p3 = this.responseDivEl.createEl("p");
+    p3.innerHTML = `If no <strong>Context Folder</strong> is selected, the content of the <strong>currently active Markdown file</strong> will automatically be used as context for your prompts.`;
+    p3.style.marginBottom = "10px";
+    const p4 = this.responseDivEl.createEl("p");
+    p4.setText("Enter your query in the prompt box below and click 'Ask AI' or press Enter.");
+    p4.style.marginTop = "15px";
+    p4.style.fontStyle = "italic";
+    this.responseDivEl.style.padding = "15px";
+    this.responseDivEl.style.color = "var(--text-normal)";
+    this.responseDivEl.findAll("p").forEach((p) => {
+      p.style.lineHeight = "1.6";
+    });
+  }
+  async loadAndDisplayHistory() {
+    this.responseDivEl.empty();
+    const history = this.plugin.settings.chatHistory;
+    if (history && history.length > 0) {
+      for (const entry of history) {
+        await this.renderConversationEntry(entry);
+      }
+      const responseSection = this.responseDivEl.parentElement;
+      if (responseSection)
+        responseSection.scrollTop = responseSection.scrollHeight;
+    } else {
+      this.displayInitialMessage();
+    }
+  }
+  async syncWithActiveFile(activeFile) {
+    const isMdFile = activeFile && activeFile.extension === "md";
+    if (!this.folderSelectEl.value) {
+      if (isMdFile) {
+        const content = await this.app.vault.cachedRead(activeFile);
+        this.currentContextContent = content;
+        this.updateConcatenatedFilesList([activeFile.name]);
+      } else {
+        this.currentContextContent = "";
+        this.updateConcatenatedFilesList([]);
+      }
+    }
+    this.updateTokenWarning();
+    this.updateLabelForPromptFileSelect();
+    this.updateLabelForFolderSelect();
+  }
+  async handleActiveLeafChange() {
+    if (!this.contentEl.isConnected) {
+      return;
+    }
+    const activeFile = this.app.workspace.getActiveFile();
+    await this.syncWithActiveFile(
+      activeFile instanceof import_obsidian.TFile ? activeFile : null
+    );
+  }
+  updateLabelForFolderSelect() {
+    var _a;
+    if (!this.folderLabelEl)
+      return;
+    if (this.folderSelectEl.value) {
+      this.folderLabelEl.setText("Context Folder:");
+    } else {
+      this.folderLabelEl.setText(
+        ((_a = this.folderSelectEl.options[0]) == null ? void 0 : _a.text) || "Select Folder"
+      );
+    }
+  }
+  updateLabelForPromptFileSelect() {
+    var _a;
+    if (!this.promptFileLabelEl)
+      return;
+    if (this.promptFileSelectEl.value) {
+      this.promptFileLabelEl.setText("Select Prompt File:");
+    } else {
+      this.promptFileLabelEl.setText(
+        ((_a = this.promptFileSelectEl.options[0]) == null ? void 0 : _a.text) || "Select Prompt"
+      );
+    }
   }
   populateFolderDropdown() {
     this.folderSelectEl.empty();
     this.folderSelectEl.createEl("option", {
-      text: "No folder selected",
+      text: "Select context folder",
       value: ""
     });
     const folders = this.app.vault.getAllLoadedFiles().filter((f) => f instanceof import_obsidian.TFolder);
@@ -244,6 +492,55 @@ var AiAssistantView = class extends import_obsidian.ItemView {
       });
     }
   }
+  populatePromptFileDropdown() {
+    this.promptFileSelectEl.empty();
+    this.promptFileSelectEl.createEl("option", {
+      text: "Prompt file location",
+      value: ""
+    });
+    let filesToList = [];
+    const promptFolderPath = this.plugin.settings.promptFilesFolderPath;
+    if (promptFolderPath) {
+      const folder = this.app.vault.getAbstractFileByPath(promptFolderPath);
+      if (folder instanceof import_obsidian.TFolder) {
+        filesToList = this.app.vault.getMarkdownFiles().filter((file) => {
+          return file.parent && file.parent.path === folder.path;
+        });
+      } else {
+        new import_obsidian.Notice(
+          `Prompt folder "${promptFolderPath}" not found. Listing all markdown files.`,
+          5e3
+        );
+        filesToList = this.app.vault.getMarkdownFiles();
+      }
+    } else {
+      filesToList = this.app.vault.getMarkdownFiles();
+    }
+    filesToList.sort((a, b) => a.path.localeCompare(b.path));
+    for (const file of filesToList) {
+      this.promptFileSelectEl.createEl("option", {
+        text: file.path,
+        // Display full path for clarity
+        value: file.path
+      });
+    }
+  }
+  async handlePromptFileSelectionChange() {
+    const selectedPath = this.promptFileSelectEl.value;
+    if (selectedPath) {
+      const file = this.app.vault.getAbstractFileByPath(selectedPath);
+      if (file && file instanceof import_obsidian.TFile && file.extension === "md") {
+        const content = await this.app.vault.cachedRead(file);
+        this.promptInputEl.value = content;
+        this.promptInputEl.dispatchEvent(new Event("input"));
+      }
+    } else {
+      this.promptInputEl.value = "";
+      this.promptInputEl.dispatchEvent(new Event("input"));
+    }
+    this.updateTokenWarning();
+    this.updateLabelForPromptFileSelect();
+  }
   async handleFolderSelectionChange() {
     const selectedPath = this.folderSelectEl.value;
     if (selectedPath) {
@@ -252,8 +549,15 @@ var AiAssistantView = class extends import_obsidian.ItemView {
     } else {
       this.currentContextContent = "";
       this.updateConcatenatedFilesList([]);
-      this.updateTokenWarning();
+      const activeFile = this.app.workspace.getActiveFile();
+      if (activeFile instanceof import_obsidian.TFile && activeFile.extension === "md") {
+        const content = await this.app.vault.cachedRead(activeFile);
+        this.currentContextContent = content;
+        this.updateConcatenatedFilesList([activeFile.name]);
+      }
     }
+    this.updateTokenWarning();
+    this.updateLabelForFolderSelect();
   }
   async loadContextFromFolder(folderPath) {
     let concatenatedContent = "";
@@ -290,12 +594,27 @@ var AiAssistantView = class extends import_obsidian.ItemView {
   updateConcatenatedFilesList(fileNames) {
     this.concatenatedFilesListEl.empty();
     if (fileNames.length === 0) {
-      this.concatenatedFilesListEl.setText(
-        "No context files loaded from selected folder."
-      );
+      if (!this.folderSelectEl.value) {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (activeFile instanceof import_obsidian.TFile && activeFile.extension === "md") {
+          this.concatenatedFilesListEl.setText(
+            `Context: ${activeFile.name} (active)`
+          );
+        } else {
+          this.concatenatedFilesListEl.setText(
+            "No context: Select a folder or open an MD file."
+          );
+        }
+      } else {
+        this.concatenatedFilesListEl.setText(
+          `No context files loaded from folder: ${this.folderSelectEl.value}`
+        );
+      }
       return;
     }
-    this.concatenatedFilesListEl.createEl("strong", { text: "Context Files:" });
+    this.concatenatedFilesListEl.createEl("strong", {
+      text: "Context Source:"
+    });
     const ul = this.concatenatedFilesListEl.createEl("ul");
     fileNames.forEach((name) => ul.createEl("li", { text: name }));
   }
@@ -431,5 +750,59 @@ var AiLifeAssistantSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
+    new import_obsidian.Setting(containerEl).setName("Prompt Files Folder").setDesc(
+      "Select a folder to source your prompt files from. If 'None', all markdown files in the vault will be listed."
+    ).addDropdown((dropdown) => {
+      dropdown.addOption("", "None (List all MD files)");
+      const folders = this.app.vault.getAllLoadedFiles().filter((f) => f instanceof import_obsidian.TFolder);
+      folders.sort((a, b) => a.path.localeCompare(b.path));
+      folders.forEach((folder) => {
+        if (folder.path === ".obsidian" || folder.path.startsWith(".obsidian/")) {
+          return;
+        }
+        dropdown.addOption(folder.path, folder.path);
+      });
+      dropdown.setValue(this.plugin.settings.promptFilesFolderPath).onChange(async (value) => {
+        this.plugin.settings.promptFilesFolderPath = value;
+        await this.plugin.saveSettings();
+        new import_obsidian.Notice(
+          `Prompt files will now be sourced from: ${value || "All vault files"}`
+        );
+      });
+    });
+    new import_obsidian.Setting(containerEl).setName("Default Prompt File").setDesc(
+      "Select a Markdown file to automatically load as a prompt when the AI Assistant view opens. You can still edit it or choose another file in the view."
+    ).addDropdown((dropdown) => {
+      dropdown.addOption("", "None (No default prompt)");
+      const markdownFiles = this.app.vault.getMarkdownFiles();
+      let filesForDefaultPromptDropdown = [];
+      const selectedPromptFolder = this.plugin.settings.promptFilesFolderPath;
+      if (selectedPromptFolder) {
+        const folder = this.app.vault.getAbstractFileByPath(selectedPromptFolder);
+        if (folder instanceof import_obsidian.TFolder) {
+          filesForDefaultPromptDropdown = markdownFiles.filter(
+            (file) => file.parent && file.parent.path === selectedPromptFolder
+          );
+        } else {
+          filesForDefaultPromptDropdown = markdownFiles;
+        }
+      } else {
+        filesForDefaultPromptDropdown = markdownFiles;
+      }
+      filesForDefaultPromptDropdown.sort(
+        (a, b) => a.path.localeCompare(b.path)
+      );
+      filesForDefaultPromptDropdown.forEach((file) => {
+        dropdown.addOption(file.path, file.path);
+      });
+      dropdown.setValue(this.plugin.settings.promptFilePath).onChange(async (value) => {
+        this.plugin.settings.promptFilePath = value;
+        await this.plugin.saveSettings();
+        if (value)
+          new import_obsidian.Notice(`Default prompt file set to: ${value}`);
+        else
+          new import_obsidian.Notice("Default prompt file cleared.");
+      });
+    });
   }
 };

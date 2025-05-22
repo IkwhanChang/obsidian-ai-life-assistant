@@ -29,6 +29,7 @@ import {
   WorkspaceLeaf,
   MarkdownFileInfo,
   Component, // Added for MarkdownRenderer context
+  TFile, // For file operations
   TFolder, // For listing folders
 } from "obsidian";
 
@@ -37,12 +38,24 @@ const AI_ASSISTANT_VIEW_TYPE = "ai-life-assistant-view";
 interface AiLifeAssistantSettings {
   openAiApiKey: string;
   defaultModel: string;
+  promptFilePath: string; // Path to the default selected prompt file
+  promptFilesFolderPath: string; // Path to the folder containing prompt files
+  chatHistory: ConversationEntry[]; // To store conversation history
 }
 
 const DEFAULT_SETTINGS: AiLifeAssistantSettings = {
   openAiApiKey: "",
   defaultModel: "gpt-4o-mini",
+  promptFilePath: "", // Default to no prompt file selected
+  promptFilesFolderPath: "", // Default to no specific prompt folder (list all MD files)
+  chatHistory: [], // Initialize with an empty history
 };
+
+interface ConversationEntry {
+  timestamp: number;
+  userPrompt: string;
+  aiResponse: string;
+}
 
 // Heuristic: Average characters per token. Adjust as needed.
 const CHARS_PER_TOKEN = 3.5; // A bit more conservative than 4
@@ -101,8 +114,13 @@ class AiAssistantView extends ItemView {
   private promptInputEl: HTMLTextAreaElement;
   private responseDivEl: HTMLDivElement;
   private folderSelectEl: HTMLSelectElement;
+  private promptFileSelectEl: HTMLSelectElement; // For selecting a prompt file
+  private folderLabelEl: HTMLLabelElement; // To dynamically change label
+  private promptFileLabelEl: HTMLLabelElement; // To dynamically change label
   private tokenWarningEl: HTMLParagraphElement;
   private concatenatedFilesListEl: HTMLDivElement; // For displaying concatenated file names
+  private submitButtonEl: HTMLButtonElement; // To manage button state
+  private thinkingPEl: HTMLParagraphElement | null = null; // To keep track of the "Thinking..." p element
 
   private currentContextContent: string = "";
 
@@ -130,35 +148,80 @@ class AiAssistantView extends ItemView {
   async onOpen() {
     const container = this.contentEl; // ItemView provides contentEl directly
     container.empty();
+    container.style.display = "flex";
+    container.style.flexDirection = "column";
+    container.style.height = "100%"; // Ensure container takes full view height
 
-    container.createEl("h4", { text: "AI Life Assistant" });
+    // --- Response Section (Top 80%) ---
+    const responseSectionDiv = container.createDiv({ cls: "ai-response-section" });
+    responseSectionDiv.style.flex = "6"; // Takes 6 parts of 10 (60%)
+    responseSectionDiv.style.overflowY = "auto";
+    responseSectionDiv.style.display = "flex"; // To allow responseDivEl to grow
+    responseSectionDiv.style.flexDirection = "column";
 
-    const inputRow = container.createDiv({ cls: "ai-input-row" });
-    // Folder select dropdown
-    const folderSelectContainer = inputRow.createDiv({
+    this.responseDivEl = responseSectionDiv.createDiv({ cls: "ai-response-area" });
+    this.responseDivEl.style.flexGrow = "1"; // Takes all available space in responseSectionDiv
+    this.responseDivEl.style.padding = "8px"; // General padding for content
+    this.responseDivEl.style.overflowY = "auto"; // Scroll for actual response content if very long
+
+    // --- Input Section (Bottom 20%) ---
+    const inputSectionDiv = container.createDiv({ cls: "ai-input-section" });
+    inputSectionDiv.style.flex = "4"; // Takes 4 parts of 10 (40%)
+    inputSectionDiv.style.overflowY = "auto"; // Scrollable if content overflows
+    inputSectionDiv.style.padding = "10px";
+    inputSectionDiv.style.borderTop = "1px solid var(--background-modifier-border)";
+
+    // Add Title to Input Section
+    inputSectionDiv.createEl("h5", { text: "AI Life Assistant" });
+
+    // --- Context Folder Selection (in Input Section) ---
+    const folderSelectContainer = inputSectionDiv.createDiv({
       cls: "ai-folder-select-container",
     });
-    folderSelectContainer.style.marginBottom = "10px";
-    folderSelectContainer.createEl("label", {
+    folderSelectContainer.style.display = "flex";
+    folderSelectContainer.style.alignItems = "center";
+    folderSelectContainer.style.marginBottom = "10px"; // Space below this row
+
+    this.folderLabelEl = folderSelectContainer.createEl("label", { // Now child of inputSectionDiv
       text: "Context Folder:",
       cls: "ai-folder-label",
-    }).style.marginRight = "5px";
+    });
+    this.folderLabelEl.style.marginRight = "5px";
 
     this.folderSelectEl = folderSelectContainer.createEl("select");
-    this.folderSelectEl.style.marginRight = "10px";
     this.populateFolderDropdown();
     this.folderSelectEl.addEventListener("change", () =>
       this.handleFolderSelectionChange()
     );
 
-    // Input row for prompt and button
-    const promptArea = container.createDiv({ cls: "ai-prompt-area" });
+    // --- Prompt File Selection (in Input Section) ---
+    const promptFileSelectContainer = inputSectionDiv.createDiv({
+      cls: "ai-prompt-file-select-container",
+    });
+    promptFileSelectContainer.style.display = "flex";
+    promptFileSelectContainer.style.alignItems = "center";
+    promptFileSelectContainer.style.marginBottom = "10px"; // Space below this row
+
+    this.promptFileLabelEl = promptFileSelectContainer.createEl("label", { // Now child of inputSectionDiv
+      text: "Select Prompt File:",
+      cls: "ai-prompt-file-label",
+    });
+    this.promptFileLabelEl.style.marginRight = "5px";
+
+    this.promptFileSelectEl = promptFileSelectContainer.createEl("select");
+    this.populatePromptFileDropdown();
+    this.promptFileSelectEl.addEventListener("change", () =>
+      this.handlePromptFileSelectionChange()
+    );
+
+    // --- Prompt Input Area (in Input Section) ---
+    const promptArea = inputSectionDiv.createDiv({ cls: "ai-prompt-area" });
     promptArea.style.display = "flex";
     promptArea.style.alignItems = "flex-end";
     promptArea.style.gap = "8px";
     promptArea.style.marginBottom = "5px";
 
-    this.promptInputEl = promptArea.createEl("textarea", {
+    this.promptInputEl = promptArea.createEl("textarea", { // Now child of inputSectionDiv
       attr: { placeholder: "Enter your prompt for the AI..." },
     });
     this.promptInputEl.style.flexGrow = "1";
@@ -166,59 +229,78 @@ class AiAssistantView extends ItemView {
     this.promptInputEl.style.maxHeight = "200px";
     this.promptInputEl.style.resize = "vertical";
     this.promptInputEl.rows = 1;
-
     this.promptInputEl.addEventListener("input", () => {
       this.promptInputEl.style.height = "auto"; // Reset height
       this.promptInputEl.style.height = `${this.promptInputEl.scrollHeight}px`;
       this.updateTokenWarning();
     });
 
-    const submitButton = promptArea.createEl("button", { text: "Ask AI" });
-    submitButton.style.height = "min-content"; // Adjust button height to content
+    this.submitButtonEl = promptArea.createEl("button", { text: "Ask AI" }); // Now child of inputSectionDiv
+    this.submitButtonEl.style.height = "min-content"; // Adjust button height to content
 
-    // Token warning display
-    this.tokenWarningEl = container.createEl("p", { cls: "ai-token-warning" });
+    // --- Token Warning Display (in Input Section) ---
+    this.tokenWarningEl = inputSectionDiv.createEl("p", { cls: "ai-token-warning" });
     this.tokenWarningEl.style.color = "var(--text-error)";
     this.tokenWarningEl.style.fontSize = "0.9em";
     this.tokenWarningEl.style.display = "none"; // Hidden by default
     this.tokenWarningEl.style.marginBottom = "10px";
 
-    // Concatenated files list display (for debugging)
-    this.concatenatedFilesListEl = container.createDiv({
+    // Concatenated files list display (in Input Section)
+    const concatenatedFilesDisplayRow = inputSectionDiv.createDiv({
+      cls: "ai-input-row concatenated-files-display-row",
+    });
+    concatenatedFilesDisplayRow.style.display = "flex"; // Keep this styling for the row itself
+    concatenatedFilesDisplayRow.style.alignItems = "flex-start";
+    concatenatedFilesDisplayRow.style.marginBottom = "10px";
+
+    this.concatenatedFilesListEl = concatenatedFilesDisplayRow.createDiv({ // Now child of inputSectionDiv
       cls: "ai-concatenated-files-list",
     });
     this.concatenatedFilesListEl.style.fontSize = "0.85em";
     this.concatenatedFilesListEl.style.color = "var(--text-muted)";
     this.concatenatedFilesListEl.style.maxHeight = "100px"; // Limit height
     this.concatenatedFilesListEl.style.overflowY = "auto"; // Add scroll if many files
-    this.concatenatedFilesListEl.style.border =
-      "1px dashed var(--background-modifier-border)";
+    this.concatenatedFilesListEl.style.border = "1px dashed var(--background-modifier-border)";
     this.concatenatedFilesListEl.style.padding = "5px";
-    this.concatenatedFilesListEl.style.marginBottom = "10px";
+    // this.concatenatedFilesListEl.style.marginBottom = "10px"; // Parent row handles bottom margin
     this.concatenatedFilesListEl.setText("No context files loaded yet."); // Initial text
 
-    // Response display area
-    this.responseDivEl = container.createDiv({ cls: "ai-response-area" });
-    this.responseDivEl.style.marginTop = "8px";
-    this.responseDivEl.style.borderTop =
-      "1px solid var(--background-modifier-border)";
-    this.responseDivEl.style.paddingTop = "8px";
-    this.responseDivEl.style.maxHeight = "calc(100vh - 300px)"; // Adjusted max height
-    this.responseDivEl.style.overflowY = "auto";
-
-    // Old inputRow styling (if needed for other elements, otherwise remove)
-    inputRow.style.display = "flex";
-    inputRow.style.alignItems = "flex-end";
-    inputRow.style.gap = "8px";
-    inputRow.style.marginBottom = "10px";
-
+    // --- Handle Submit ---
     const handleSubmit = async () => {
+      const originalButtonText = this.submitButtonEl.textContent;
+      this.submitButtonEl.textContent = "Thinking...";
+      this.setUIEnabled(false);
+      
+      const isFirstUserInteractionInSession = this.plugin.settings.chatHistory.length === 0 && 
+                                              !this.responseDivEl.querySelector('.conversation-entry');
+
+      if (isFirstUserInteractionInSession) {
+        this.responseDivEl.empty(); // Clear welcome message
+      }
+
+      // Remove previous "Thinking..." if it exists (e.g. from a quick re-submit or error)
+      if (this.thinkingPEl && this.thinkingPEl.parentElement === this.responseDivEl) {
+        this.thinkingPEl.remove();
+        this.thinkingPEl = null;
+      }
+
+      // Display "Thinking..."
+      this.thinkingPEl = this.responseDivEl.createEl("p", {
+        text: "Thinking...",
+      });
+      this.thinkingPEl.addClass("ai-thinking-message");
+      this.thinkingPEl.style.fontStyle = "italic";
+      this.thinkingPEl.style.textAlign = "center";
+      this.thinkingPEl.style.padding = "10px";
+
       const userPromptText = this.promptInputEl.value;
       if (!userPromptText.trim()) {
         new Notice("Please enter a prompt.");
+        if (this.thinkingPEl && this.thinkingPEl.parentElement) { this.thinkingPEl.remove(); this.thinkingPEl = null; }
+        this.submitButtonEl.textContent = originalButtonText;
+        this.setUIEnabled(true);
         return;
       }
-
       const totalTokens = this.estimateTokens(
         this.currentContextContent + userPromptText
       );
@@ -230,35 +312,42 @@ class AiAssistantView extends ItemView {
           `Token limit exceeded! Current: ~${totalTokens} (Max: ${MAX_CONTEXT_TOKENS}). Shorten prompt or context.`
         );
         this.tokenWarningEl.style.display = "block";
+        if (this.thinkingPEl && this.thinkingPEl.parentElement) { this.thinkingPEl.remove(); this.thinkingPEl = null; }
+        this.submitButtonEl.textContent = originalButtonText;
+        this.setUIEnabled(true);
         return;
       }
 
       try {
-        new Notice("AI에게 물어보는 중...");
-        this.responseDivEl.empty(); // Clear previous response
         const systemPrompt =
           "You are a helpful AI assistant. Please format your response in Markdown.";
-        const response = await this.plugin.callOpenAI(
+        
+        const rawMarkdownResponse = await this.plugin.callOpenAI(
           systemPrompt,
           userPromptText,
           this.currentContextContent
         );
 
-        // Use 'this' (the ItemView instance) as the component context for MarkdownRenderer
-        await MarkdownRenderer.renderMarkdown(
-          response,
-          this.responseDivEl,
-          this.app.vault.getRoot().path, // Base path for relative links
-          this as Component // Cast to Component
-        );
+        if (this.thinkingPEl && this.thinkingPEl.parentElement) { this.thinkingPEl.remove(); this.thinkingPEl = null; }
+
+        const newEntry: ConversationEntry = {
+          timestamp: Date.now(),
+          userPrompt: userPromptText,
+          aiResponse: rawMarkdownResponse,
+        };
+
+        this.plugin.settings.chatHistory.push(newEntry);
+        await this.plugin.saveSettings();
+        
+        this.renderConversationEntry(newEntry, true); // Append and scroll
 
         this.promptInputEl.value = ""; // Clear input
         this.promptInputEl.style.height = "auto"; // Reset height
         this.promptInputEl.rows = 1;
-        this.promptInputEl.focus(); // Focus back on input
         this.updateTokenWarning(); // Reset token warning if prompt is cleared
       } catch (error: any) {
-        this.responseDivEl.empty();
+        if (this.thinkingPEl && this.thinkingPEl.parentElement) { this.thinkingPEl.remove(); this.thinkingPEl = null; }
+
         if (error.message !== "OpenAI API Key not set.") {
           console.error("Error interacting with AI from panel:", error);
           new Notice(`Error: ${error.message}. Check console for details.`);
@@ -267,11 +356,17 @@ class AiAssistantView extends ItemView {
           text: `Error: ${error.message}`,
           cls: "ai-error-message",
         });
+        errorP.style.padding = "10px";
         errorP.style.color = "var(--text-error)";
+      } finally {
+        if (this.thinkingPEl && this.thinkingPEl.parentNode === this.responseDivEl) { this.thinkingPEl.remove(); this.thinkingPEl = null; } // Ensure thinking is gone
+        this.submitButtonEl.textContent = originalButtonText;
+        this.setUIEnabled(true);
+        this.promptInputEl.focus(); // Focus back on input
       }
     };
 
-    submitButton.addEventListener("click", handleSubmit);
+    this.submitButtonEl.addEventListener("click", handleSubmit);
 
     this.promptInputEl.addEventListener(
       "keydown",
@@ -283,15 +378,217 @@ class AiAssistantView extends ItemView {
       }
     );
 
-    this.updateTokenWarning(); // Initial check
+    // Initial setup after populating dropdowns and attaching listeners:
+    // 1. Load prompt from settings if available (and if it exists)
+    // This is the only place settings.promptFilePath is used for initial prompt.
+    if (this.plugin.settings.promptFilePath) {
+      const defaultPromptFile = this.app.vault.getAbstractFileByPath(
+        this.plugin.settings.promptFilePath
+      );
+      if (
+        defaultPromptFile instanceof TFile &&
+        defaultPromptFile.extension === "md"
+      ) {
+        const optionExists = Array.from(this.promptFileSelectEl.options).some(
+          (opt) => opt.value === defaultPromptFile.path
+        );
+        if (optionExists) {
+          this.promptFileSelectEl.value = defaultPromptFile.path;
+          await this.handlePromptFileSelectionChange(); // Explicitly load content
+        }
+      }
+    } // If not set or not found, it will just use the default "Prompt file location"
+
+    // 2. Sync with the current active file (or lack thereof)
+    const currentActiveFile = this.app.workspace.getActiveFile();
+    await this.syncWithActiveFile(
+      currentActiveFile instanceof TFile ? currentActiveFile : null
+    );
+
+    this.loadAndDisplayHistory(); // Load and display history or initial message
+
+    // Ensure labels are correct after initial sync and potential settings load
+    this.updateLabelForFolderSelect();
+    this.updateLabelForPromptFileSelect();
+    this.updateTokenWarning(); // Initial token check after potential loads
+
+    // Register event listener for active leaf changes
+    this.registerEvent(
+      this.app.workspace.on(
+        "active-leaf-change",
+        this.handleActiveLeafChange.bind(this)
+      )
+    );
+
     // Focus the input field when the view is opened
     setTimeout(() => this.promptInputEl.focus(), 50);
+  }
+
+  private setUIEnabled(enabled: boolean): void {
+    this.promptInputEl.disabled = !enabled;
+    this.submitButtonEl.disabled = !enabled;
+    this.folderSelectEl.disabled = !enabled;
+    this.promptFileSelectEl.disabled = !enabled;
+  }
+
+  private async renderConversationEntry(entry: ConversationEntry, isNewest: boolean = false) {
+    const entryContainer = this.responseDivEl.createDiv({ cls: "conversation-entry" });
+    entryContainer.style.marginBottom = "20px";
+    entryContainer.style.padding = "10px";
+    entryContainer.style.border = "1px solid var(--background-modifier-border-hover)";
+    entryContainer.style.borderRadius = "5px";
+
+    // User Prompt
+    const userPromptDiv = entryContainer.createDiv({ cls: "user-prompt-entry" });
+    userPromptDiv.createEl("strong", { text: "You:" });
+    const userP = userPromptDiv.createEl("p", { text: entry.userPrompt });
+    userP.style.whiteSpace = "pre-wrap"; // Preserve line breaks
+    userP.style.marginTop = "5px";
+
+    // AI Response
+    const aiResponseDiv = entryContainer.createDiv({ cls: "ai-response-entry" });
+    aiResponseDiv.style.marginTop = "10px";
+    aiResponseDiv.createEl("strong", { text: "AI:" });
+    const aiResponseContentDiv = aiResponseDiv.createDiv();
+    aiResponseContentDiv.style.marginTop = "5px";
+
+    await MarkdownRenderer.renderMarkdown(
+      entry.aiResponse,
+      aiResponseContentDiv,
+      this.app.vault.getRoot().path,
+      this as Component
+    );
+
+    // Add Copy button for AI Response
+    const copyButtonContainer = aiResponseDiv.createDiv({ cls: "ai-response-copy-button-container" });
+    copyButtonContainer.style.textAlign = "right";
+    copyButtonContainer.style.marginTop = "10px";
+    const copyButton = copyButtonContainer.createEl("button", { text: "Copy" });
+    copyButton.addClass("mod-cta");
+    copyButton.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(entry.aiResponse);
+        new Notice("Response copied to clipboard!");
+      } catch (err) {
+        console.error("Failed to copy response: ", err);
+        new Notice("Failed to copy response.");
+      }
+    });
+
+    if (isNewest) {
+      // Scroll the main response section to the bottom to show the new entry
+      const responseSection = this.responseDivEl.parentElement; // This should be responseSectionDiv
+      if (responseSection) {
+        responseSection.scrollTop = responseSection.scrollHeight;
+      }
+    }
+  }
+
+  private displayInitialMessage(): void {
+    if (!this.responseDivEl) return;
+    this.responseDivEl.empty();
+
+    this.responseDivEl.createEl("h4", { text: "Welcome to AI Life Assistant!"});
+
+    const p1 = this.responseDivEl.createEl("p");
+    p1.innerHTML = `며Select a <strong>Context Folder</strong> from the options below. The content of the files within this folder (up to the token limit of ~${MAX_CONTEXT_TOKENS}) will be combined with your prompt to provide context to the AI.`;
+    p1.style.marginBottom = "10px";
+
+    const p2 = this.responseDivEl.createEl("p");
+    p2.innerHTML = `You can set a <strong>Default Prompt File</strong> and a specific <strong>Prompt Files Folder</strong> in the plugin settings (click the gear icon in Obsidian's sidebar) for quicker access to your favorite prompts.`;
+    p2.style.marginBottom = "10px";
+
+    const p3 = this.responseDivEl.createEl("p");
+    p3.innerHTML = `If no <strong>Context Folder</strong> is selected, the content of the <strong>currently active Markdown file</strong> will automatically be used as context for your prompts.`;
+    p3.style.marginBottom = "10px";
+
+    const p4 = this.responseDivEl.createEl("p");
+    p4.setText("Enter your query in the prompt box below and click 'Ask AI' or press Enter.");
+    p4.style.marginTop = "15px";
+    p4.style.fontStyle = "italic";
+
+    // Style the overall message container if needed
+    this.responseDivEl.style.padding = "15px";
+    this.responseDivEl.style.color = "var(--text-normal)";
+    this.responseDivEl.findAll("p").forEach(p => {
+        p.style.lineHeight = "1.6";
+    });
+  }
+
+  private async loadAndDisplayHistory() {
+    this.responseDivEl.empty();
+    const history = this.plugin.settings.chatHistory;
+
+    if (history && history.length > 0) {
+      for (const entry of history) {
+        await this.renderConversationEntry(entry);
+      }
+      // Scroll to bottom after loading all history
+      const responseSection = this.responseDivEl.parentElement;
+      if (responseSection) responseSection.scrollTop = responseSection.scrollHeight;
+    } else {
+      this.displayInitialMessage();
+    }
+  }
+  private async syncWithActiveFile(activeFile: TFile | null) {
+    const isMdFile = activeFile && activeFile.extension === "md";
+
+    // Prompt area is no longer synced with the active file.
+
+    // Sync Context Area
+    if (!this.folderSelectEl.value) {
+      // If "No folder selected"
+      if (isMdFile) {
+        const content = await this.app.vault.cachedRead(activeFile);
+        this.currentContextContent = content;
+        this.updateConcatenatedFilesList([activeFile.name]);
+      } else {
+        this.currentContextContent = "";
+        this.updateConcatenatedFilesList([]);
+      }
+    }
+    this.updateTokenWarning();
+    this.updateLabelForPromptFileSelect(); // Ensure prompt label is correct
+    this.updateLabelForFolderSelect();
+  }
+
+  private async handleActiveLeafChange() {
+    if (!this.contentEl.isConnected) {
+      // Check if the view is still part of the DOM
+      return;
+    }
+    const activeFile = this.app.workspace.getActiveFile();
+    await this.syncWithActiveFile(
+      activeFile instanceof TFile ? activeFile : null
+    );
+  }
+
+  private updateLabelForFolderSelect(): void {
+    if (!this.folderLabelEl) return;
+    if (this.folderSelectEl.value) {
+      this.folderLabelEl.setText("Context Folder:");
+    } else {
+      this.folderLabelEl.setText(
+        this.folderSelectEl.options[0]?.text || "Select Folder"
+      );
+    }
+  }
+
+  private updateLabelForPromptFileSelect(): void {
+    if (!this.promptFileLabelEl) return;
+    if (this.promptFileSelectEl.value) {
+      this.promptFileLabelEl.setText("Select Prompt File:");
+    } else {
+      this.promptFileLabelEl.setText(
+        this.promptFileSelectEl.options[0]?.text || "Select Prompt"
+      );
+    }
   }
 
   private populateFolderDropdown(): void {
     this.folderSelectEl.empty();
     this.folderSelectEl.createEl("option", {
-      text: "No folder selected",
+      text: "Select context folder",
       value: "",
     });
 
@@ -312,6 +609,62 @@ class AiAssistantView extends ItemView {
     }
   }
 
+  private populatePromptFileDropdown(): void {
+    this.promptFileSelectEl.empty();
+    this.promptFileSelectEl.createEl("option", {
+      text: "Prompt file location",
+      value: "",
+    });
+
+    let filesToList: TFile[] = [];
+    const promptFolderPath = this.plugin.settings.promptFilesFolderPath;
+
+    if (promptFolderPath) {
+      const folder = this.app.vault.getAbstractFileByPath(promptFolderPath);
+      if (folder instanceof TFolder) {
+        filesToList = this.app.vault.getMarkdownFiles().filter((file) => {
+          return file.parent && file.parent.path === folder.path;
+        });
+      } else {
+        new Notice(
+          `Prompt folder "${promptFolderPath}" not found. Listing all markdown files.`,
+          5000
+        );
+        filesToList = this.app.vault.getMarkdownFiles(); // Fallback
+      }
+    } else {
+      // No specific prompt folder set, list all markdown files
+      filesToList = this.app.vault.getMarkdownFiles();
+    }
+
+    filesToList.sort((a, b) => a.path.localeCompare(b.path)); // Sort files by path
+
+    for (const file of filesToList) {
+      this.promptFileSelectEl.createEl("option", {
+        text: file.path, // Display full path for clarity
+        value: file.path,
+      });
+    }
+  }
+
+  private async handlePromptFileSelectionChange(): Promise<void> {
+    const selectedPath = this.promptFileSelectEl.value;
+    if (selectedPath) {
+      const file = this.app.vault.getAbstractFileByPath(selectedPath);
+      if (file && file instanceof TFile && file.extension === "md") {
+        const content = await this.app.vault.cachedRead(file);
+        this.promptInputEl.value = content;
+        this.promptInputEl.dispatchEvent(new Event("input")); // To update height and token count
+      }
+    } else {
+      // If "Prompt file location" (empty value) is selected, clear the input
+      this.promptInputEl.value = "";
+      this.promptInputEl.dispatchEvent(new Event("input"));
+    }
+    this.updateTokenWarning();
+    this.updateLabelForPromptFileSelect();
+  }
+
   private async handleFolderSelectionChange(): Promise<void> {
     const selectedPath = this.folderSelectEl.value;
     if (selectedPath) {
@@ -320,8 +673,16 @@ class AiAssistantView extends ItemView {
     } else {
       this.currentContextContent = "";
       this.updateConcatenatedFilesList([]); // Clear the list
-      this.updateTokenWarning();
+      // If "No folder selected", context should now come from the active file
+      const activeFile = this.app.workspace.getActiveFile();
+      if (activeFile instanceof TFile && activeFile.extension === "md") {
+        const content = await this.app.vault.cachedRead(activeFile);
+        this.currentContextContent = content;
+        this.updateConcatenatedFilesList([activeFile.name]);
+      }
     }
+    this.updateTokenWarning();
+    this.updateLabelForFolderSelect();
   }
 
   private async loadContextFromFolder(folderPath: string): Promise<void> {
@@ -373,12 +734,30 @@ class AiAssistantView extends ItemView {
   private updateConcatenatedFilesList(fileNames: string[]): void {
     this.concatenatedFilesListEl.empty(); // Clear previous list
     if (fileNames.length === 0) {
-      this.concatenatedFilesListEl.setText(
-        "No context files loaded from selected folder."
-      );
+      if (!this.folderSelectEl.value) {
+        // No folder selected
+        const activeFile = this.app.workspace.getActiveFile();
+        if (activeFile instanceof TFile && activeFile.extension === "md") {
+          // This state should ideally be caught by fileNames.length > 0 if syncWithActiveFile worked
+          this.concatenatedFilesListEl.setText(
+            `Context: ${activeFile.name} (active)`
+          );
+        } else {
+          this.concatenatedFilesListEl.setText(
+            "No context: Select a folder or open an MD file."
+          );
+        }
+      } else {
+        // A folder is selected, but it's empty or failed to load
+        this.concatenatedFilesListEl.setText(
+          `No context files loaded from folder: ${this.folderSelectEl.value}`
+        );
+      }
       return;
     }
-    this.concatenatedFilesListEl.createEl("strong", { text: "Context Files:" });
+    this.concatenatedFilesListEl.createEl("strong", {
+      text: "Context Source:",
+    });
     const ul = this.concatenatedFilesListEl.createEl("ul");
     fileNames.forEach((name) => ul.createEl("li", { text: name }));
   }
@@ -549,20 +928,97 @@ class AiLifeAssistantSettingTab extends PluginSettingTab {
           })
       );
 
-			new Setting(containerEl)
-  .setName("Default Model")
-  .setDesc("Select the default ChatGPT model to use.")
-  .addDropdown((dropdown) =>
-    dropdown
-      .addOption("o4-mini", "o4-mini")
-      .addOption("gpt-4.1-mini", "gpt-4.1-mini")
-      .addOption("gpt-4.1-nano", "gpt-4.1-nano")
-      .addOption("gpt-4o-mini", "gpt-4o-mini")
-      .setValue(this.plugin.settings.defaultModel)
-      .onChange(async (value) => {
-        this.plugin.settings.defaultModel = value;
-        await this.plugin.saveSettings();
-      })
-  );
+    new Setting(containerEl)
+      .setName("Default Model")
+      .setDesc("Select the default ChatGPT model to use.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("o4-mini", "o4-mini")
+          .addOption("gpt-4.1-mini", "gpt-4.1-mini")
+          .addOption("gpt-4.1-nano", "gpt-4.1-nano")
+          .addOption("gpt-4o-mini", "gpt-4o-mini")
+          .setValue(this.plugin.settings.defaultModel)
+          .onChange(async (value) => {
+            this.plugin.settings.defaultModel = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Prompt Files Folder")
+      .setDesc(
+        "Select a folder to source your prompt files from. If 'None', all markdown files in the vault will be listed."
+      )
+      .addDropdown((dropdown) => {
+        dropdown.addOption("", "None (List all MD files)");
+        const folders = this.app.vault
+          .getAllLoadedFiles()
+          .filter((f) => f instanceof TFolder) as TFolder[];
+        folders.sort((a, b) => a.path.localeCompare(b.path));
+        folders.forEach((folder) => {
+          if (
+            folder.path === ".obsidian" ||
+            folder.path.startsWith(".obsidian/")
+          ) {
+            return; // Skip obsidian config folder
+          }
+          dropdown.addOption(folder.path, folder.path);
+        });
+        dropdown
+          .setValue(this.plugin.settings.promptFilesFolderPath)
+          .onChange(async (value) => {
+            this.plugin.settings.promptFilesFolderPath = value;
+            await this.plugin.saveSettings();
+            new Notice(
+              `Prompt files will now be sourced from: ${
+                value || "All vault files"
+              }`
+            );
+          });
+      });
+    new Setting(containerEl)
+      .setName("Default Prompt File")
+      .setDesc(
+        "Select a Markdown file to automatically load as a prompt when the AI Assistant view opens. You can still edit it or choose another file in the view."
+      )
+      .addDropdown((dropdown) => {
+        dropdown.addOption("", "None (No default prompt)");
+        const markdownFiles = this.app.vault.getMarkdownFiles();
+        let filesForDefaultPromptDropdown: TFile[] = [];
+        const selectedPromptFolder = this.plugin.settings.promptFilesFolderPath;
+
+        if (selectedPromptFolder) {
+          const folder =
+            this.app.vault.getAbstractFileByPath(selectedPromptFolder);
+          if (folder instanceof TFolder) {
+            filesForDefaultPromptDropdown = markdownFiles.filter(
+              (file) => file.parent && file.parent.path === selectedPromptFolder
+            );
+          } else {
+            // Folder not found or invalid, list all as a fallback for this setting
+            filesForDefaultPromptDropdown = markdownFiles;
+          }
+        } else {
+          // No prompt folder selected, list all MD files
+          filesForDefaultPromptDropdown = markdownFiles;
+        }
+
+        filesForDefaultPromptDropdown.sort((a, b) =>
+          a.path.localeCompare(b.path)
+        );
+        filesForDefaultPromptDropdown.forEach((file) => {
+          dropdown.addOption(file.path, file.path);
+        });
+
+        dropdown
+          .setValue(this.plugin.settings.promptFilePath)
+          .onChange(async (value) => {
+            this.plugin.settings.promptFilePath = value;
+            await this.plugin.saveSettings();
+            // Optionally, notify the user or update the view if it's open
+            if (value) new Notice(`Default prompt file set to: ${value}`);
+            else new Notice("Default prompt file cleared.");
+          });
+      });
   }
 }
